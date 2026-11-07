@@ -17,14 +17,23 @@ package sfu
 import (
 	"fmt"
 	"hash/fnv"
+	"io"
 	"math/rand"
 	"runtime"
 	"sync"
 	"testing"
 
 	"github.com/gammazero/workerpool"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
+
+	"github.com/livekit/livekit-server/pkg/sfu/buffer"
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils/mono"
 )
 
 func TestWebRTCReceiver_OnCloseHandler(t *testing.T) {
@@ -50,6 +59,176 @@ func TestWebRTCReceiver_OnCloseHandler(t *testing.T) {
 			assert.NotNil(t, w.onCloseHandler)
 		})
 	}
+}
+
+type receiverCloseTestSender struct {
+	TrackSender
+	subscriberID                   livekit.ParticipantID
+	upTrackMaxPublishedLayerChange func(int32)
+}
+
+func (s *receiverCloseTestSender) SubscriberID() livekit.ParticipantID {
+	return s.subscriberID
+}
+
+func (s *receiverCloseTestSender) UpTrackMaxPublishedLayerChange(layer int32) {
+	if s.upTrackMaxPublishedLayerChange != nil {
+		s.upTrackMaxPublishedLayerChange(layer)
+	}
+}
+
+func (s *receiverCloseTestSender) UpTrackMaxTemporalLayerSeenChange(int32) {}
+
+func TestReceiverBaseAddDownTrackReturnsClosedWhenCloseWinsRace(t *testing.T) {
+	receiver := NewReceiverBase(
+		ReceiverBaseParams{
+			TrackID:  "track",
+			StreamID: "stream",
+			Kind:     webrtc.RTPCodecTypeAudio,
+			Codec: webrtc.RTPCodecParameters{
+				RTPCodecCapability: webrtc.RTPCodecCapability{
+					MimeType:  webrtc.MimeTypeOpus,
+					ClockRate: 48000,
+					Channels:  2,
+				},
+				PayloadType: 111,
+			},
+			Logger: logger.GetLogger(),
+		},
+		&livekit.TrackInfo{
+			Sid:    "track",
+			Type:   livekit.TrackType_AUDIO,
+			Source: livekit.TrackSource_MICROPHONE,
+		},
+		ReceiverCodecStateNormal,
+	)
+
+	enteredAdd := make(chan struct{})
+	resumeAdd := make(chan struct{})
+	track := &receiverCloseTestSender{
+		subscriberID: "subscriber",
+		upTrackMaxPublishedLayerChange: func(int32) {
+			close(enteredAdd)
+			<-resumeAdd
+		},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- receiver.AddDownTrack(track)
+	}()
+
+	// AddDownTrack has passed its initial IsClosed check and is paused
+	// before reaching the final TryStore.
+	<-enteredAdd
+
+	// Close terminally drains/closes the spreader before AddDownTrack resumes.
+	receiver.Close("test", false)
+	close(resumeAdd)
+
+	err := <-errCh
+	require.ErrorIs(t, err, ErrReceiverClosed)
+	require.True(t, receiver.IsClosed())
+	require.Empty(t, receiver.GetDownTracks())
+}
+
+func TestReceiverBaseSetMaxExpectedSpatialLayerClampsOutOfRange(t *testing.T) {
+	receiver := NewReceiverBase(
+		ReceiverBaseParams{
+			TrackID:  "track",
+			StreamID: "stream",
+			Kind:     webrtc.RTPCodecTypeVideo,
+			Codec: webrtc.RTPCodecParameters{
+				RTPCodecCapability: webrtc.RTPCodecCapability{
+					MimeType:  webrtc.MimeTypeVP8,
+					ClockRate: 90000,
+				},
+				PayloadType: 96,
+			},
+			Logger: logger.GetLogger(),
+		},
+		&livekit.TrackInfo{
+			Sid:    "track",
+			Type:   livekit.TrackType_VIDEO,
+			Source: livekit.TrackSource_CAMERA,
+		},
+		ReceiverCodecStateNormal,
+	)
+	defer receiver.Close("test", false)
+
+	// layers below InvalidLayerSpatial and above DefaultMaxLayerSpatial are clamped
+	require.NotPanics(t, func() { receiver.SetMaxExpectedSpatialLayer(-2) })
+	require.NotPanics(t, func() { receiver.SetMaxExpectedSpatialLayer(buffer.DefaultMaxLayerSpatial + 5) })
+	require.NotPanics(t, func() { receiver.SetMaxExpectedSpatialLayer(buffer.InvalidLayerSpatial) })
+}
+
+// burstBuffer serves count packets from ReadExtended, then io.EOF.
+type burstBuffer struct {
+	buffer.BufferProvider
+	count int
+}
+
+func (b *burstBuffer) ReadExtended([]byte) (*buffer.ExtPacket, error) {
+	if b.count == 0 {
+		return nil, io.EOF
+	}
+	b.count--
+	return &buffer.ExtPacket{
+		Arrival: mono.UnixNano(),
+		Packet:  &rtp.Packet{Header: rtp.Header{PayloadType: 111}},
+	}, nil
+}
+
+type writeTestSender struct {
+	receiverCloseTestSender
+}
+
+func (s *writeTestSender) WriteRTP(*buffer.ExtPacket, int32) int32 {
+	return 1
+}
+
+func (s *writeTestSender) Close() {}
+
+func TestReceiverBaseRecordsProcessingPerSubscriber(t *testing.T) {
+	receiver := NewReceiverBase(
+		ReceiverBaseParams{
+			TrackID:  "track",
+			StreamID: "stream",
+			Kind:     webrtc.RTPCodecTypeAudio,
+			Codec: webrtc.RTPCodecParameters{
+				RTPCodecCapability: webrtc.RTPCodecCapability{
+					MimeType:  webrtc.MimeTypeOpus,
+					ClockRate: 48000,
+					Channels:  2,
+				},
+				PayloadType: 111,
+			},
+			Logger: logger.GetLogger(),
+		},
+		&livekit.TrackInfo{
+			Sid:    "track",
+			Type:   livekit.TrackType_AUDIO,
+			Source: livekit.TrackSource_MICROPHONE,
+		},
+		ReceiverCodecStateNormal,
+	)
+	defer receiver.Close("test", false)
+
+	fs := &ForwardStats{ring: make([]forwardIntervalSummary, 1)}
+	receiver.SetForwardStats(fs)
+	require.NoError(t, receiver.AddDownTrack(&writeTestSender{receiverCloseTestSender{subscriberID: "subscriber"}}))
+
+	buff := &burstBuffer{count: 6}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	receiver.forwardRTP(0, buff, receiver.forwardersGeneration.Load(), &wg)
+
+	fs.flush()
+	summ := fs.ring[0]
+	require.Equal(t, int64(6), summ.transit.count)
+	// every packet written to a subscriber carries its processing per subscriber
+	require.Equal(t, int64(6), summ.processingPerSubscriber.count)
 }
 
 func BenchmarkWriteRTP(b *testing.B) {

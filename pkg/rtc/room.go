@@ -59,7 +59,7 @@ const (
 
 	simulateDisconnectSignalTimeout = 5 * time.Second
 
-	dataMessageCacheTTL  = 2 * time.Second
+	dataMessageCacheTTL  = 10 * time.Second
 	dataMessageCacheSize = 100_000
 )
 
@@ -254,7 +254,7 @@ func NewRoom(
 	egressLauncher EgressLauncher,
 ) *Room {
 	r := &Room{
-		protoRoom: utils.CloneProto(room),
+		protoRoom: proto.CloneOf(room),
 		internal:  internal,
 		logger: LoggerWithRoom(
 			logger.GetLogger().WithComponent(sutils.ComponentRoom),
@@ -586,7 +586,7 @@ func (r *Room) ResumeParticipant(
 		ClientConfiguration: p.GetClientConfiguration(),
 		ServerInfo:          r.serverInfo,
 		LastMessageSeq:      p.GetLastReliableSequence(false),
-	}); err != nil {
+	}, nil); err != nil {
 		return err
 	}
 
@@ -625,9 +625,7 @@ func (r *Room) onSyncState(participant types.LocalParticipant, state *livekit.Sy
 	pLogger.Infow("setting sync state", "state", logger.Proto(state))
 
 	shouldReconnect := false
-	pubTracks := state.GetPublishTracks()
-	existingPubTracks := participant.GetPublishedTracks()
-	for _, pubTrack := range pubTracks {
+	for _, pubTrack := range state.GetPublishTracks() {
 		// client may not have sent TrackInfo for each published track
 		ti := pubTrack.Track
 		if ti == nil {
@@ -636,18 +634,10 @@ func (r *Room) onSyncState(participant types.LocalParticipant, state *livekit.Sy
 			break
 		}
 
-		found := false
-		for _, existingPubTrack := range existingPubTracks {
-			if existingPubTrack.ID() == livekit.TrackID(ti.Sid) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			// is there a pending track?
-			found = participant.GetPendingTrack(livekit.TrackID(ti.Sid)) != nil
-		}
-		if !found {
+		// pending first cannot miss a track moving to published; one published then closed in between reads as unknown,
+		// which is fine since signals are handled sequentially per participant, so only participant close can do that
+		trackID := livekit.TrackID(ti.Sid)
+		if participant.GetPendingTrack(trackID) == nil && participant.GetPublishedTrack(trackID) == nil {
 			pLogger.Warnw("unknown track during resume", nil, "trackID", ti.Sid)
 			shouldReconnect = true
 			break
@@ -874,7 +864,7 @@ func (r *Room) GetAgentDispatches(dispatchID string) ([]*livekit.AgentDispatch, 
 
 	for _, ad := range r.agentDispatches {
 		if dispatchID == "" || ad.Id == dispatchID {
-			ret = append(ret, utils.CloneProto(ad.AgentDispatch))
+			ret = append(ret, proto.CloneOf(ad.AgentDispatch))
 		}
 	}
 
@@ -1431,6 +1421,9 @@ func (r *Room) RemoveParticipant(
 	delete(r.hasPublished, identity)
 	delete(r.launchedTrackEgresses, identity)
 	delete(r.agentParticpants, identity)
+	// recorded while the participant is being removed, not after it is closed:
+	// the room is already empty to CloseIfEmpty, which runs every second
+	r.leftAt.Store(time.Now().Unix())
 	if !p.Hidden() {
 		r.protoRoom.NumParticipants--
 	}
@@ -1490,8 +1483,6 @@ func (r *Room) RemoveParticipant(
 
 	// close participant as well
 	_ = p.Close(true, reason, false)
-
-	r.leftAt.Store(time.Now().Unix())
 
 	if sendUpdates {
 		if r.onParticipantChanged != nil {
@@ -1587,7 +1578,7 @@ func (r *Room) sendSpeakerChanges(speakers []*livekit.SpeakerInfo) {
 
 func (r *Room) updateProto() *livekit.Room {
 	r.lock.RLock()
-	room := utils.CloneProto(r.protoRoom)
+	room := proto.CloneOf(r.protoRoom)
 	r.lock.RUnlock()
 
 	room.NumPublishers = 0
@@ -1658,7 +1649,7 @@ func (r *Room) audioUpdateWorker() {
 		// changedSpeakers need to include previous speakers that are no longer speaking
 		for sid, speaker := range lastActiveMap {
 			if nextActiveMap[sid] == nil {
-				inactiveSpeaker := utils.CloneProto(speaker)
+				inactiveSpeaker := proto.CloneOf(speaker)
 				inactiveSpeaker.Level = 0
 				inactiveSpeaker.Active = false
 				changedSpeakers = append(changedSpeakers, inactiveSpeaker)
@@ -2179,12 +2170,32 @@ func BroadcastDataPacketForRoom(
 }
 
 func BroadcastDataMessageForRoom(r types.Room, source types.LocalParticipant, data []byte, logger logger.Logger) {
+	// source is nil for data relayed from a remote node
+	var sourceID livekit.ParticipantID
+	var sourceIdentity livekit.ParticipantIdentity
+	if source != nil {
+		sourceID = source.ID()
+		sourceIdentity = source.Identity()
+	}
+
+	BroadcastDataMessageForRoomFrom(r, sourceID, sourceIdentity, data, logger)
+}
+
+// BroadcastDataMessageForRoomFrom sends an unlabeled data message to every local participant, stamping
+// sourceIdentity as the sender and skipping the local participant with sourceID, if there is one.
+func BroadcastDataMessageForRoomFrom(
+	r types.Room,
+	sourceID livekit.ParticipantID,
+	sourceIdentity livekit.ParticipantIdentity,
+	data []byte,
+	logger logger.Logger,
+) {
 	utils.ParallelExec(r.GetLocalParticipants(), dataForwardLoadBalanceThreshold, 1, func(op types.LocalParticipant) {
-		if source != nil && op.ID() == source.ID() {
+		if sourceID != "" && op.ID() == sourceID {
 			return
 		}
 
-		op.SendDataMessageUnlabeled(data, false, source.Identity())
+		op.SendDataMessageUnlabeled(data, false, sourceIdentity)
 	})
 }
 

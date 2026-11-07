@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"reflect"
@@ -29,7 +30,7 @@ import (
 
 	"github.com/jxskiss/base62"
 	"github.com/pion/sdp/v3"
-	"github.com/pion/stun/v3"
+	"github.com/pion/stun/v4"
 	"github.com/pion/turn/v5"
 	"github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
@@ -864,7 +865,12 @@ func TestSingleNodeAttributes(t *testing.T) {
 				if pubRemote == nil {
 					return "could not find remote publisher"
 				}
-				attrs := pubRemote.Attributes
+				attrs := maps.Clone(pubRemote.Attributes)
+				// the server stamps when it received the join request
+				if attrs[livekit.AttrRTCJoinRequestTime] == "" {
+					return fmt.Sprintf("did not receive the join request time: %v", attrs)
+				}
+				delete(attrs, livekit.AttrRTCJoinRequestTime)
 				if !reflect.DeepEqual(attrs, map[string]string{
 					"a": "0",
 					"b": "2",
@@ -1100,30 +1106,30 @@ func TestDataPublishSlowSubscriber(t *testing.T) {
 
 			// no data should be dropped for fast subscriber
 			var fastDataIndex atomic.Uint64
-			fastSub.OnDataReceived = func(data []byte, sid string) {
+			fastSub.SetOnDataReceived(func(data []byte, sid string) {
 				idx := binary.BigEndian.Uint64(data[len(data)-8:])
 				require.Equal(t, fastDataIndex.Load()+1, idx)
 				fastDataIndex.Store(idx)
-			}
+			})
 
 			// no data should be dropped for slow subscriber that is above threshold
 			var slowNoDropDataIndex atomic.Uint64
 			var drainSlowSubNotDrop atomic.Bool
 			slowNoDropReader := testclient.NewDataChannelReader(dataChannelSlowThreshold * 2)
-			slowSubNotDrop.OnDataReceived = func(data []byte, sid string) {
+			slowSubNotDrop.SetOnDataReceived(func(data []byte, sid string) {
 				idx := binary.BigEndian.Uint64(data[len(data)-8:])
 				require.Equal(t, slowNoDropDataIndex.Load()+1, idx)
 				slowNoDropDataIndex.Store(idx)
 				if !drainSlowSubNotDrop.Load() {
 					slowNoDropReader.Read(data, sid)
 				}
-			}
+			})
 
 			// data should be dropped for slow subscriber that is below threshold
 			var slowDropDataIndex atomic.Uint64
 			dropped := make(chan struct{})
 			slowDropReader := testclient.NewDataChannelReader(dataChannelSlowThreshold / 2)
-			slowSubDrop.OnDataReceived = func(data []byte, sid string) {
+			slowSubDrop.SetOnDataReceived(func(data []byte, sid string) {
 				select {
 				case <-dropped:
 					return
@@ -1135,7 +1141,7 @@ func TestDataPublishSlowSubscriber(t *testing.T) {
 				}
 				slowDropDataIndex.Store(idx)
 				slowDropReader.Read(data, sid)
-			}
+			})
 
 			// publisher sends data as fast as possible, it will block by the slowest subscriber above the slow threshold
 			var (

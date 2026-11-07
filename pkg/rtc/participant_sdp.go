@@ -15,20 +15,19 @@
 package rtc
 
 import (
-	"fmt"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/protocol/codecs/mime"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	lksdp "github.com/livekit/protocol/sdp"
-	"github.com/livekit/protocol/utils"
 )
 
 func (p *ParticipantImpl) populateSdpCid(parsedOffer *sdp.SessionDescription) ([]*sdp.MediaDescription, []*sdp.MediaDescription) {
@@ -50,6 +49,11 @@ func (p *ParticipantImpl) populateSdpCid(parsedOffer *sdp.SessionDescription) ([
 			}
 
 			p.pendingTracksLock.Lock()
+			if p.isReleasedTrackCidLocked(streamID) {
+				p.pendingTracksLock.Unlock()
+				continue
+			}
+
 			signalCid, info, _, migrated, _ := p.getPendingTrack(streamID, trackType, false)
 			if migrated {
 				p.pendingTracksLock.Unlock()
@@ -143,7 +147,7 @@ func (p *ParticipantImpl) populateSdpCid(parsedOffer *sdp.SessionDescription) ([
 			}
 
 			if updated {
-				p.pendingTracks[signalCid].trackInfos[0] = utils.CloneProto(info)
+				p.pendingTracks[signalCid].trackInfos[0] = proto.CloneOf(info)
 				p.pubLogger.Debugw(
 					"pending track SDP cid updated",
 					"signalCid", signalCid,
@@ -217,15 +221,7 @@ func (p *ParticipantImpl) setCodecPreferencesForPublisherMedia(
 			continue
 		}
 
-		p.pendingTracksLock.RLock()
-		mt := p.getPublishedTrackBySdpCid(streamID)
-		if mt != nil {
-			ti = mt.ToProto()
-		} else {
-			_, ti, _, _, _ = p.getPendingTrack(streamID, trackType, false)
-		}
-		p.pendingTracksLock.RUnlock()
-
+		ti = p.getTrackInfoBySdpCid(streamID, trackType)
 		if ti == nil {
 			unprocessed = append(unprocessed, unmatch)
 			continue
@@ -319,9 +315,8 @@ func (p *ParticipantImpl) setCodecPreferencesOpusRedForPublisher(
 
 // configure publisher answer for audio track's dtx and stereo settings
 func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescription) webrtc.SessionDescription {
-	offer := p.TransportManager.LastPublisherOffer()
-	parsedOffer, err := offer.Unmarshal()
-	if err != nil {
+	parsedOffer := p.TransportManager.LastPublisherOfferParsed()
+	if parsedOffer == nil {
 		return answer
 	}
 
@@ -330,6 +325,9 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 		return answer
 	}
 
+	// payload type lookup scans the whole answer, resolve it once
+	opusPT, opusPTErr := parsedAnswer.GetPayloadTypeForCodec(sdp.Codec{Name: mime.MimeTypeCodecOpus.String()})
+	changed := false
 	for _, m := range parsedAnswer.MediaDescriptions {
 		switch m.MediaName.Media {
 		case "audio":
@@ -354,14 +352,7 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 					if !ok {
 						continue
 					}
-					track, _ := p.getPublishedTrackBySdpCid(streamID).(*MediaTrack)
-					if track == nil {
-						p.pendingTracksLock.RLock()
-						_, ti, _, _, _ = p.getPendingTrack(streamID, livekit.TrackType_AUDIO, false)
-						p.pendingTracksLock.RUnlock()
-					} else {
-						ti = track.ToProto()
-					}
+					ti = p.getTrackInfoBySdpCid(streamID, livekit.TrackType_AUDIO)
 					break
 				}
 			}
@@ -371,31 +362,37 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 				continue
 			}
 
-			opusPT, err := parsedAnswer.GetPayloadTypeForCodec(sdp.Codec{Name: mime.MimeTypeCodecOpus.String()})
-			if err != nil {
-				p.pubLogger.Infow("failed to get opus payload type", "error", err, "trackID", ti.Sid)
+			if opusPTErr != nil {
+				p.pubLogger.Infow("failed to get opus payload type", "error", opusPTErr, "trackID", ti.Sid)
 				continue
 			}
 
-			for i, attr := range m.Attributes {
-				if strings.HasPrefix(attr.String(), fmt.Sprintf("fmtp:%d", opusPT)) {
-					if !slices.Contains(ti.AudioFeatures, livekit.AudioTrackFeature_TF_NO_DTX) {
-						attr.Value += ";usedtx=1"
-					} else {
-						attr.Value = strings.ReplaceAll(attr.Value, ";usedtx=1", "")
+			opusFmtpPT := strconv.Itoa(int(opusPT))
+			attrs := m.Attributes[:0]
+			for _, attr := range m.Attributes {
+				if pt, _, _ := strings.Cut(attr.Value, " "); attr.Key == "fmtp" && pt == opusFmtpPT {
+					changed = true
+					var ok bool
+					attr.Value, ok = rewriteOpusFmtp(
+						attr.Value,
+						!slices.Contains(ti.AudioFeatures, livekit.AudioTrackFeature_TF_NO_DTX),
+						slices.Contains(ti.AudioFeatures, livekit.AudioTrackFeature_TF_STEREO),
+					)
+					if !ok {
+						continue
 					}
-					if slices.Contains(ti.AudioFeatures, livekit.AudioTrackFeature_TF_STEREO) {
-						attr.Value += ";stereo=1;maxaveragebitrate=510000"
-					} else {
-						attr.Value = strings.ReplaceAll(attr.Value, ";stereo=1", "")
-					}
-					m.Attributes[i] = attr
 				}
+				attrs = append(attrs, attr)
 			}
+			m.Attributes = attrs
 
 		default:
 			continue
 		}
+	}
+
+	if !changed {
+		return answer
 	}
 
 	bytes, err := parsedAnswer.Marshal()
@@ -405,4 +402,30 @@ func (p *ParticipantImpl) configurePublisherAnswer(answer webrtc.SessionDescript
 	}
 	answer.SDP = string(bytes)
 	return answer
+}
+
+// rewrites by key, so a leading stereo=1 or usedtx=1 is replaced too and the rest keep their order;
+// false means nothing remains and the caller drops the line, since libwebrtc rejects a bare a=fmtp:<pt>
+func rewriteOpusFmtp(value string, dtx, stereo bool) (string, bool) {
+	payloadType, params, _ := strings.Cut(value, " ")
+	var kept []string
+	for _, param := range strings.Split(params, ";") {
+		key, _, _ := strings.Cut(param, "=")
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "", "usedtx", "stereo":
+			continue
+		case "maxaveragebitrate":
+			if stereo {
+				continue
+			}
+		}
+		kept = append(kept, param)
+	}
+	if dtx {
+		kept = append(kept, "usedtx=1")
+	}
+	if stereo {
+		kept = append(kept, "stereo=1", "maxaveragebitrate=510000")
+	}
+	return payloadType + " " + strings.Join(kept, ";"), len(kept) > 0
 }

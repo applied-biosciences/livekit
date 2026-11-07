@@ -18,13 +18,14 @@ import (
 	"context"
 	"fmt"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/protocol/agent"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
-	"github.com/livekit/protocol/utils"
 	"github.com/livekit/protocol/utils/guid"
 	"github.com/livekit/psrpc"
 )
@@ -64,6 +65,9 @@ func (ag *AgentDispatchService) CreateDispatch(ctx context.Context, req *livekit
 		return nil, psrpc.NewError(psrpc.InvalidArgument, err)
 	}
 
+	if !ag.limitConf.CheckRoomNameLength(req.Room) {
+		return nil, fmt.Errorf("%w: max length %d", ErrRoomNameExceedsLimits, ag.limitConf.MaxRoomNameLength)
+	}
 	if !ag.limitConf.CheckMetadataSize(req.Metadata) {
 		return nil, ErrMetadataExceedsLimits
 	}
@@ -120,7 +124,7 @@ func redactCreateAgentDispatchRequest(req *livekit.CreateAgentDispatchRequest) *
 		return req
 	}
 
-	clone := utils.CloneProto(req)
+	clone := proto.CloneOf(req)
 
 	// replace with size of metadata to provide visibility on request size
 	if clone.Metadata != "" {

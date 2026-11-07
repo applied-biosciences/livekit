@@ -33,23 +33,28 @@ type DependencyDescriptorWriter struct {
 	descriptor   *DependencyDescriptor
 	structure    *FrameDependencyStructure
 	activeChains uint32
-	writer       *BitStreamWriter
+	writer       BitStreamWriter
 	bestTemplate TemplateMatch
 }
 
-func NewDependencyDescriptorWriter(buf []byte, structure *FrameDependencyStructure, activeChains uint32, descriptor *DependencyDescriptor) (*DependencyDescriptorWriter, error) {
-	writer := NewBitStreamWriter(buf)
-	w := &DependencyDescriptorWriter{
+func newDependencyDescriptorWriter(buf []byte, structure *FrameDependencyStructure, activeChains uint32, descriptor *DependencyDescriptor) DependencyDescriptorWriter {
+	return DependencyDescriptorWriter{
 		descriptor:   descriptor,
 		structure:    structure,
 		activeChains: activeChains,
-		writer:       writer,
+		writer:       BitStreamWriter{buf: buf},
 	}
-	return w, w.findBestTemplate()
 }
 
-func (w *DependencyDescriptorWriter) ResetBuf(buf []byte) {
-	w.writer = NewBitStreamWriter(buf)
+func NewDependencyDescriptorWriter(buf []byte, structure *FrameDependencyStructure, activeChains uint32, descriptor *DependencyDescriptor) (*DependencyDescriptorWriter, error) {
+	w := newDependencyDescriptorWriter(buf, structure, activeChains, descriptor)
+	return &w, w.findBestTemplate()
+}
+
+// withBuf returns a copy of the writer that writes into buf, value receiver so a caller owned buffer does not escape
+func (w DependencyDescriptorWriter) withBuf(buf []byte) DependencyDescriptorWriter {
+	w.writer = BitStreamWriter{buf: buf}
+	return w
 }
 
 func (w *DependencyDescriptorWriter) Write() error {
@@ -434,6 +439,9 @@ func (w *DependencyDescriptorWriter) writeFrameChains() error {
 	for i := 0; i < w.structure.NumChains; i++ {
 		chainDiff := 0
 		if w.activeChains&(1<<i) != 0 {
+			if i >= len(w.descriptor.FrameDependencies.ChainDiffs) {
+				return fmt.Errorf("no chain diff for chain %d, chain diffs: %d", i, len(w.descriptor.FrameDependencies.ChainDiffs))
+			}
 			chainDiff = w.descriptor.FrameDependencies.ChainDiffs[i]
 		}
 		if err := w.writeBits(uint64(chainDiff), 8); err != nil {

@@ -16,15 +16,18 @@ package rtc
 
 import (
 	"fmt"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/livekit/protocol/auth/authfakes"
 	"github.com/livekit/protocol/livekit"
-	"github.com/livekit/protocol/utils"
 	"github.com/livekit/protocol/webhook"
 
 	"github.com/livekit/livekit-server/version"
@@ -51,7 +54,11 @@ const (
 )
 
 func init() {
-	config.InitLoggerFromConfig(&config.DefaultConfig.Logging)
+	// The logger retains this config and locks it on every component level
+	// resolution, so it must not be DefaultConfig: NewConfig marshals that
+	// global from the goroutines these tests spin up.
+	loggingConf := config.LoggingConfig{PionLevel: config.DefaultConfig.Logging.PionLevel}
+	config.InitLoggerFromConfig(&loggingConf)
 	roomUpdateInterval = defaultDelay
 }
 
@@ -287,7 +294,7 @@ func TestPushAndDequeueUpdates(t *testing.T) {
 		{
 			name:     "last version is enqueued",
 			pi:       subscriber1v2,
-			existing: &ParticipantUpdate{ParticipantInfo: utils.CloneProto(subscriber1v1)}, // clone the existing value since it can be modified when setting to disconnected
+			existing: &ParticipantUpdate{ParticipantInfo: proto.CloneOf(subscriber1v1)}, // clone the existing value since it can be modified when setting to disconnected
 			validate: func(t *testing.T, rm *Room, _ []*ParticipantUpdate) {
 				queued := rm.batchedUpdates[livekit.ParticipantIdentity(identity)]
 				require.NotNil(t, queued)
@@ -297,7 +304,7 @@ func TestPushAndDequeueUpdates(t *testing.T) {
 		{
 			name:      "latest version when immediate",
 			pi:        subscriber1v2,
-			existing:  &ParticipantUpdate{ParticipantInfo: utils.CloneProto(subscriber1v1)},
+			existing:  &ParticipantUpdate{ParticipantInfo: proto.CloneOf(subscriber1v1)},
 			immediate: true,
 			expected:  []*ParticipantUpdate{{ParticipantInfo: subscriber1v2}},
 			validate: func(t *testing.T, rm *Room, _ []*ParticipantUpdate) {
@@ -308,7 +315,7 @@ func TestPushAndDequeueUpdates(t *testing.T) {
 		{
 			name:     "out of order updates are rejected",
 			pi:       subscriber1v1,
-			existing: &ParticipantUpdate{ParticipantInfo: utils.CloneProto(subscriber1v2)},
+			existing: &ParticipantUpdate{ParticipantInfo: proto.CloneOf(subscriber1v2)},
 			validate: func(t *testing.T, rm *Room, updates []*ParticipantUpdate) {
 				queued := rm.batchedUpdates[livekit.ParticipantIdentity(identity)]
 				requirePIEquals(t, subscriber1v2, queued.ParticipantInfo)
@@ -318,7 +325,7 @@ func TestPushAndDequeueUpdates(t *testing.T) {
 			name:        "sid change is broadcasted immediately with synthsized disconnect",
 			pi:          publisher2,
 			closeReason: types.ParticipantCloseReasonServiceRequestRemoveParticipant, // just to test if update contain the close reason
-			existing:    &ParticipantUpdate{ParticipantInfo: utils.CloneProto(subscriber1v2), CloseReason: types.ParticipantCloseReasonStale},
+			existing:    &ParticipantUpdate{ParticipantInfo: proto.CloneOf(subscriber1v2), CloseReason: types.ParticipantCloseReasonStale},
 			expected: []*ParticipantUpdate{
 				{
 					ParticipantInfo: &livekit.ParticipantInfo{
@@ -336,7 +343,7 @@ func TestPushAndDequeueUpdates(t *testing.T) {
 		{
 			name:     "when switching to publisher, queue is cleared",
 			pi:       publisher1v2,
-			existing: &ParticipantUpdate{ParticipantInfo: utils.CloneProto(subscriber1v1)},
+			existing: &ParticipantUpdate{ParticipantInfo: proto.CloneOf(subscriber1v1)},
 			expected: []*ParticipantUpdate{{ParticipantInfo: publisher1v2}},
 			validate: func(t *testing.T, rm *Room, updates []*ParticipantUpdate) {
 				require.Empty(t, rm.batchedUpdates)
@@ -397,6 +404,55 @@ func TestRoomClosure(t *testing.T) {
 		require.Equal(t, types.RoomCloseReasonIdleTimeout, closeReason)
 
 		require.Equal(t, ErrRoomClosed, rm.Join(p, nil, nil, iceServersForRoom))
+	})
+
+	// the idle check runs every second and can land while the last participant
+	// is still closing, when the room is empty but its departure has not been
+	// recorded yet
+	closeDuringRemove := func(t *testing.T, priorDeparture bool) bool {
+		rm := newRoomWithParticipants(t, testRoomOpts{num: 1})
+		var isClosed atomic.Bool
+		rm.OnClose(func(types.RoomCloseReason) {
+			isClosed.Store(true)
+		})
+
+		rm.lock.Lock()
+		rm.protoRoom.DepartureTimeout = 20
+		if priorDeparture {
+			// someone left earlier in the session, so a departure is recorded
+			rm.protoRoom.CreationTime = time.Now().Unix()
+			rm.leftAt.Store(time.Now().Add(-time.Minute).Unix())
+		} else {
+			// older than the empty timeout, as a room in a call for a while is
+			rm.protoRoom.CreationTime = time.Now().Add(-10 * time.Minute).Unix()
+		}
+		rm.lock.Unlock()
+
+		p := rm.GetParticipants()[0].(*typesfakes.FakeLocalParticipant)
+		closing := make(chan struct{})
+		release := make(chan struct{})
+		p.CloseStub = func(bool, types.ParticipantCloseReason, bool) error {
+			close(closing)
+			<-release
+			return nil
+		}
+
+		go rm.RemoveParticipant(p.Identity(), p.ID(), types.ParticipantCloseReasonClientRequestLeave)
+
+		<-closing
+		require.Empty(t, rm.GetParticipants())
+		rm.CloseIfEmpty()
+		close(release)
+
+		return isClosed.Load()
+	}
+
+	t.Run("room does not close while the last participant is closing", func(t *testing.T) {
+		require.False(t, closeDuringRemove(t, false))
+	})
+
+	t.Run("room does not close while the last participant is closing, after an earlier departure", func(t *testing.T) {
+		require.False(t, closeDuringRemove(t, true))
 	})
 
 	t.Run("room does not close before empty timeout", func(t *testing.T) {
@@ -647,7 +703,7 @@ func TestDataChannel(t *testing.T) {
 				}
 				setSource(mode, packet, p)
 
-				packetExp := utils.CloneProto(packet)
+				packetExp := proto.CloneOf(packet)
 				if mode != legacySID {
 					packetExp.ParticipantIdentity = string(p.Identity())
 					packetExp.GetUser().ParticipantIdentity = string(p.Identity())
@@ -695,7 +751,7 @@ func TestDataChannel(t *testing.T) {
 				setSource(mode, packet, p)
 				setDest(mode, packet, p1)
 
-				packetExp := utils.CloneProto(packet)
+				packetExp := proto.CloneOf(packet)
 				if mode != legacySID {
 					packetExp.ParticipantIdentity = string(p.Identity())
 					packetExp.GetUser().ParticipantIdentity = string(p.Identity())
@@ -717,6 +773,53 @@ func TestDataChannel(t *testing.T) {
 				_, got, _, _ := p1.SendDataMessageArgsForCall(0)
 				require.Equal(t, encoded, got)
 			})
+		}
+	})
+
+	t.Run("unlabeled broadcast without source", func(t *testing.T) {
+		rm := newRoomWithParticipants(t, testRoomOpts{num: 2})
+		defer rm.Close(types.RoomCloseReasonUnknown)
+
+		BroadcastDataMessageForRoom(rm, nil, []byte("relayed"), rm.logger)
+
+		for _, op := range rm.GetParticipants() {
+			fp := op.(*typesfakes.FakeLocalParticipant)
+			require.Equal(t, 1, fp.SendDataMessageUnlabeledCallCount())
+			got, _, sender := fp.SendDataMessageUnlabeledArgsForCall(0)
+			require.Equal(t, []byte("relayed"), got)
+			require.Empty(t, sender)
+		}
+	})
+
+	t.Run("unlabeled broadcast from a remote identity", func(t *testing.T) {
+		rm := newRoomWithParticipants(t, testRoomOpts{num: 2})
+		defer rm.Close(types.RoomCloseReasonUnknown)
+
+		BroadcastDataMessageForRoomFrom(rm, "", "remote", []byte("relayed"), rm.logger)
+
+		for _, op := range rm.GetParticipants() {
+			fp := op.(*typesfakes.FakeLocalParticipant)
+			require.Equal(t, 1, fp.SendDataMessageUnlabeledCallCount())
+			got, _, sender := fp.SendDataMessageUnlabeledArgsForCall(0)
+			require.Equal(t, []byte("relayed"), got)
+			require.Equal(t, livekit.ParticipantIdentity("remote"), sender)
+		}
+	})
+
+	t.Run("unlabeled broadcast from a local id skips the source", func(t *testing.T) {
+		rm := newRoomWithParticipants(t, testRoomOpts{num: 2})
+		defer rm.Close(types.RoomCloseReasonUnknown)
+
+		participants := rm.GetParticipants()
+		p := participants[0].(*typesfakes.FakeLocalParticipant)
+		BroadcastDataMessageForRoomFrom(rm, p.ID(), p.Identity(), []byte("local"), rm.logger)
+
+		require.Zero(t, p.SendDataMessageUnlabeledCallCount())
+		for _, op := range participants[1:] {
+			fp := op.(*typesfakes.FakeLocalParticipant)
+			require.Equal(t, 1, fp.SendDataMessageUnlabeledCallCount())
+			_, _, sender := fp.SendDataMessageUnlabeledArgsForCall(0)
+			require.Equal(t, p.Identity(), sender)
 		}
 	})
 
@@ -853,6 +956,7 @@ func newRoomWithParticipants(t *testing.T, opts testRoomOpts) *Room {
 		telemetry.NewTelemetryService(n, &telemetryfakes.FakeAnalyticsService{}),
 		nil, nil, nil,
 	)
+	t.Cleanup(func() { rm.Close(types.RoomCloseReasonUnknown) })
 	for i := 0; i < opts.num+opts.numHidden; i++ {
 		identity := livekit.ParticipantIdentity(fmt.Sprintf("p%d", i))
 		participant := NewMockParticipant(identity, opts.protocol, i >= opts.num, true, rm.LocalParticipantListener())
@@ -866,4 +970,63 @@ func newRoomWithParticipants(t *testing.T, opts testRoomOpts) *Room {
 		})
 	}
 	return rm
+}
+
+const parkedReaderDeadline = 5 * time.Second
+
+// a reader parked in RLock has wait reason RWMutex.RLock in its runtime.Stack header, also
+// under CI's deadlock wrapper; the match omits the package so CI's rewrite cannot edit it
+func waitForParkedReader(t *testing.T, frame string) {
+	deadline := time.Now().Add(parkedReaderDeadline)
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		for n == len(buf) {
+			buf = make([]byte, 2*len(buf))
+			n = runtime.Stack(buf, true)
+		}
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			header, _, _ := strings.Cut(g, "\n")
+			if strings.Contains(header, "RWMutex.RLock]") && strings.Contains(g, frame) {
+				return
+			}
+		}
+		require.Less(t, time.Now(), deadline, "no goroutine parked in RLock under %s", frame)
+		runtime.Gosched()
+	}
+}
+
+func TestSyncStateWhileTrackMovesToPublished(t *testing.T) {
+	const cid = "C"
+	p := newParticipantForTest("test")
+	p.AddTrack(&livekit.AddTrackRequest{Cid: cid, Name: "mic", Type: livekit.TrackType_AUDIO})
+	sid := p.pendingTracks[cid].trackInfos[0].Sid
+
+	// the mover takes pendingTracksLock, then parks in AddPublishedTrack on the lock held here
+	p.UpTrackManager.lock.Lock()
+	release := sync.OnceFunc(p.UpTrackManager.lock.Unlock)
+	defer release()
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		p.pendingTracksLock.Lock()
+		defer p.pendingTracksLock.Unlock()
+		signalCid, ti, _, _, _ := p.getPendingTrack(cid, livekit.TrackType_AUDIO, true)
+		p.addMediaTrack(signalCid, ti)
+	})
+	deadline := time.Now().Add(parkedReaderDeadline)
+	for p.pendingTracksLock.RWMutex.TryRLock() {
+		p.pendingTracksLock.RWMutex.RUnlock()
+		require.Less(t, time.Now(), deadline, "move never took pendingTracksLock")
+		runtime.Gosched()
+	}
+
+	wg.Go(func() {
+		(&Room{}).onSyncState(p, &livekit.SyncState{
+			PublishTracks: []*livekit.TrackPublishedResponse{{Track: &livekit.TrackInfo{Sid: sid}}},
+		})
+	})
+	waitForParkedReader(t, "(*Room).onSyncState")
+	release()
+	wg.Wait()
+	require.False(t, p.IsClosed(), "resume forced a full reconnect for a track that moved to published")
 }

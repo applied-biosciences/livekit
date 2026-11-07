@@ -15,21 +15,24 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/multierr"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/livekit/livekit-server/pkg/agent/endpoint"
 	protoagent "github.com/livekit/protocol/agent"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
-	"github.com/livekit/protocol/utils"
 	"github.com/livekit/protocol/utils/guid"
 	"github.com/livekit/psrpc"
 )
@@ -46,6 +49,43 @@ var (
 )
 
 const AgentNameAttributeKey = "lk.agent_name"
+
+// JobAttemptAttributeKey names the job attempt an agent's token was issued for,
+// so the room can turn away the agent of an attempt it has already ended. See
+// FormatJobAttempt.
+const JobAttemptAttributeKey = "lk.agent.job_attempt"
+
+// JobAttempt returns the attempt of a job that its state describes. An attempt
+// is identified by its StartedAt, which AssignJob orders after the job's
+// previous attempt; see advance.
+func JobAttempt(state *livekit.JobState) int64 {
+	return state.GetStartedAt()
+}
+
+// FormatJobAttempt identifies a job's attempt by the job ID and the attempt.
+func FormatJobAttempt(jobID livekit.JobID, attempt int64) string {
+	return string(jobID) + ":" + strconv.FormatInt(attempt, 10)
+}
+
+// advance returns a job's StartedAt or UpdatedAt after prev: now, unless the
+// node that wrote prev has a clock ahead of this one. A job's attempts, and the
+// versions of its state, are then ordered across nodes whatever their clocks.
+func advance(prev, now int64) int64 {
+	return max(now, prev+1)
+}
+
+// ParseJobAttempt reads an attempt that FormatJobAttempt wrote.
+func ParseJobAttempt(s string) (livekit.JobID, int64, bool) {
+	i := strings.LastIndexByte(s, ':')
+	if i <= 0 {
+		return "", 0, false
+	}
+	attempt, err := strconv.ParseInt(s[i+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return livekit.JobID(s[:i]), attempt, true
+}
 
 type WorkerProtocolVersion int
 
@@ -155,6 +195,12 @@ type WorkerRegistration struct {
 	Permissions *livekit.ParticipantPermission
 	ClientIP    string
 	Deployment  string
+
+	// agent HTTP endpoints data plane
+	Endpoints        []*livekit.AgentHttp_AgentEndpoint
+	InstanceID       string
+	EndpointSettings *livekit.AgentHttp_AgentEndpointSettings
+
 	// KindDetails, when set by the server, are stamped onto the participant
 	// join token minted for every job assigned to this worker (e.g. marking
 	// hosted/cloud agents so they can be distinguished from self-hosted ones in
@@ -172,21 +218,52 @@ func MakeWorkerRegistration() WorkerRegistration {
 
 var _ WorkerSignalHandler = (*WorkerRegisterer)(nil)
 
+// WorkerRegisterHandler takes a turn during a worker's registration: it reads the
+// request, validates the part it owns, and fills in its part of the response and
+// the registration. Returning an error fails the registration.
+type WorkerRegisterHandler func(req *livekit.RegisterWorkerRequest, res *livekit.RegisterWorkerResponse, reg *WorkerRegistration) error
+
+// EndpointRegisterHandler owns a worker's endpoint declaration: it validates the
+// declaration and negotiates the data-plane settings. A registration declaring no
+// endpoints passes through untouched.
+func EndpointRegisterHandler(req *livekit.RegisterWorkerRequest, res *livekit.RegisterWorkerResponse, reg *WorkerRegistration) error {
+	if len(req.GetEndpoints()) == 0 {
+		return nil
+	}
+	// endpoints are addressed at /agents/{agent_name}/{deployment}/..., with the
+	// name percent-encoded into that segment
+	if req.GetAgentName() == "" {
+		return errors.New("agent HTTP endpoints require an agent name")
+	}
+	if endpoint.IsReservedAgentName(req.GetAgentName()) {
+		return fmt.Errorf("agent name %q is reserved and cannot serve HTTP endpoints", req.GetAgentName())
+	}
+	settings, err := endpoint.NegotiateSettings(req)
+	if err != nil {
+		return err
+	}
+	res.EndpointSettings = settings
+	reg.EndpointSettings = settings
+	return nil
+}
+
 type WorkerRegisterer struct {
 	WorkerPingHandler
 	serverInfo *livekit.ServerInfo
 	deadline   time.Time
+	handlers   []WorkerRegisterHandler
 
 	registration WorkerRegistration
 	registered   bool
 }
 
-func NewWorkerRegisterer(conn SignalConn, serverInfo *livekit.ServerInfo, base WorkerRegistration) *WorkerRegisterer {
+func NewWorkerRegisterer(conn SignalConn, serverInfo *livekit.ServerInfo, base WorkerRegistration, handlers ...WorkerRegisterHandler) *WorkerRegisterer {
 	return &WorkerRegisterer{
 		WorkerPingHandler: WorkerPingHandler{conn: conn},
 		serverInfo:        serverInfo,
 		registration:      base,
 		deadline:          time.Now().Add(RegisterTimeout),
+		handlers:          handlers,
 	}
 }
 
@@ -227,15 +304,22 @@ func (h *WorkerRegisterer) HandleRegister(req *livekit.RegisterWorkerRequest) er
 	h.registration.JobType = req.GetType()
 	h.registration.Permissions = permissions
 	h.registration.Deployment = req.GetDeployment()
+	h.registration.Endpoints = req.GetEndpoints()
+	h.registration.InstanceID = req.GetInstanceId()
+
+	res := &livekit.RegisterWorkerResponse{
+		WorkerId:   h.registration.ID,
+		ServerInfo: h.serverInfo,
+	}
+	for _, handle := range h.handlers {
+		if err := handle(req, res, &h.registration); err != nil {
+			return err
+		}
+	}
 	h.registered = true
 
 	_, err := h.conn.WriteServerMessage(&livekit.ServerMessage{
-		Message: &livekit.ServerMessage_Register{
-			Register: &livekit.RegisterWorkerResponse{
-				WorkerId:   h.registration.ID,
-				ServerInfo: h.serverInfo,
-			},
-		},
+		Message: &livekit.ServerMessage_Register{Register: res},
 	})
 	return err
 }
@@ -254,9 +338,11 @@ type Worker struct {
 	cancel context.CancelFunc
 	closed chan struct{}
 
-	mu     sync.Mutex
-	load   float32
-	status livekit.WorkerStatus
+	mu        sync.Mutex
+	load      float32
+	status    livekit.WorkerStatus
+	statusSeq uint64
+	draining  bool
 
 	runningJobs  map[livekit.JobID]*livekit.Job
 	availability map[livekit.JobID]chan *livekit.AvailabilityResponse
@@ -333,12 +419,35 @@ func (w *Worker) GetJobState(jobID livekit.JobID) (*livekit.JobState, error) {
 	if !ok {
 		return nil, ErrJobNotFound
 	}
-	return utils.CloneProto(j.State), nil
+	return proto.CloneOf(j.State), nil
+}
+
+// AttachJob tracks a job the worker already runs as if AssignJob had assigned
+// it here, so the worker handles its status updates and termination, and
+// returns its state. The job keeps the StartedAt it was assigned with, which
+// identifies the run. Like AssignJob, it does not route the job to the worker:
+// that is the caller's.
+func (w *Worker) AttachJob(job *livekit.Job) *livekit.JobState {
+	job = proto.CloneOf(job)
+	if job.State == nil {
+		job.State = &livekit.JobState{}
+	}
+	now := time.Now().UnixNano()
+	job.State.WorkerId = w.ID
+	job.State.AgentId = w.AgentID
+	job.State.UpdatedAt = advance(job.State.UpdatedAt, now)
+	job.State.StartedAt = cmp.Or(job.State.StartedAt, now)
+	job.State.Status = livekit.JobStatus_JS_RUNNING
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.runningJobs[livekit.JobID(job.Id)] = job
+	return proto.CloneOf(job.State)
 }
 
 func (w *Worker) AssignJob(ctx context.Context, job *livekit.Job, hook AssignmentHook) (*livekit.JobState, error) {
 	availCh := make(chan *livekit.AvailabilityResponse, 1)
-	job = utils.CloneProto(job)
+	job = proto.CloneOf(job)
 	jobID := livekit.JobID(job.Id)
 
 	w.mu.Lock()
@@ -362,9 +471,13 @@ func (w *Worker) AssignJob(ctx context.Context, job *livekit.Job, hook Assignmen
 	now := time.Now()
 	job.State.WorkerId = w.ID
 	job.State.AgentId = w.AgentID
-	job.State.UpdatedAt = now.UnixNano()
-	job.State.StartedAt = now.UnixNano()
+	job.State.UpdatedAt = advance(job.State.UpdatedAt, now.UnixNano())
+	// StartedAt identifies the attempt: after the one the request carries, the
+	// job's previous attempt or its creation; see advance
+	job.State.StartedAt = advance(job.State.StartedAt, now.UnixNano())
 	job.State.Status = livekit.JobStatus_JS_RUNNING
+	// a retry carries the previous attempt's times
+	job.State.AcceptedAt, job.State.AssignedAt = 0, 0
 
 	if _, err := w.conn.WriteServerMessage(&livekit.ServerMessage{Message: &livekit.ServerMessage_Availability{
 		Availability: &livekit.AvailabilityRequest{Job: job},
@@ -379,7 +492,8 @@ func (w *Worker) AssignJob(ctx context.Context, job *livekit.Job, hook Assignmen
 	select {
 	case res := <-availCh:
 		if res.Terminate {
-			job.State.EndedAt = now.UnixNano()
+			// the attempt may have started past this node's clock; see advance
+			job.State.EndedAt = advance(job.State.StartedAt, now.UnixNano())
 			job.State.Status = livekit.JobStatus_JS_SUCCESS
 			return job.State, nil
 		}
@@ -387,6 +501,8 @@ func (w *Worker) AssignJob(ctx context.Context, job *livekit.Job, hook Assignmen
 		if !res.Available {
 			return nil, ErrWorkerNotAvailable
 		}
+		// offset from StartedAt, which may be past this node's clock; see advance
+		job.State.AcceptedAt = job.State.StartedAt + time.Since(now).Nanoseconds()
 
 		job.State.ParticipantIdentity = res.ParticipantIdentity
 		attributes := res.ParticipantAttributes
@@ -394,6 +510,7 @@ func (w *Worker) AssignJob(ctx context.Context, job *livekit.Job, hook Assignmen
 			attributes = make(map[string]string)
 		}
 		attributes[AgentNameAttributeKey] = w.AgentName
+		attributes[JobAttemptAttributeKey] = FormatJobAttempt(jobID, JobAttempt(job.State))
 
 		token, err := protoagent.BuildAgentToken(
 			w.apiKey,
@@ -420,15 +537,20 @@ func (w *Worker) AssignJob(ctx context.Context, job *livekit.Job, hook Assignmen
 		if hook != nil {
 			send = hook(send)
 		}
+		job.State.AssignedAt = job.State.StartedAt + time.Since(now).Nanoseconds()
+		state := proto.CloneOf(job.State)
+
+		// must be in runningJobs before the assignment is sent; stored as a copy because send reads job without w.mu.
+		w.mu.Lock()
+		w.runningJobs[jobID] = proto.CloneOf(job)
+		w.mu.Unlock()
+
 		if err := send(&livekit.JobAssignment{Job: job, Token: token}); err != nil {
+			w.mu.Lock()
+			delete(w.runningJobs, jobID)
+			w.mu.Unlock()
 			return nil, err
 		}
-
-		state := utils.CloneProto(job.State)
-
-		w.mu.Lock()
-		w.runningJobs[jobID] = job
-		w.mu.Unlock()
 
 		// TODO sweep jobs that are never started. We can't do this until all SDKs actually update the the JOB state
 
@@ -540,7 +662,7 @@ func (w *Worker) UpdateJobStatus(update *livekit.UpdateJobStatus) (*livekit.JobS
 	}
 
 	now := time.Now()
-	job.State.UpdatedAt = now.UnixNano()
+	job.State.UpdatedAt = advance(job.State.UpdatedAt, now.UnixNano())
 
 	if job.State.Status == livekit.JobStatus_JS_PENDING && update.Status != livekit.JobStatus_JS_PENDING {
 		job.State.StartedAt = now.UnixNano()
@@ -550,7 +672,8 @@ func (w *Worker) UpdateJobStatus(update *livekit.UpdateJobStatus) (*livekit.JobS
 	job.State.Error = update.Error
 
 	if JobStatusIsEnded(update.Status) {
-		job.State.EndedAt = now.UnixNano()
+		// the attempt may have started past this node's clock; see advance
+		job.State.EndedAt = advance(job.State.StartedAt, now.UnixNano())
 		delete(w.runningJobs, jobID)
 
 		w.logger.Infow("job ended", "jobID", update.JobId, "status", update.Status, "error", update.Error)
@@ -588,13 +711,28 @@ func (w *Worker) HandleUpdateWorker(update *livekit.UpdateWorkerStatus) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// status updates may interleave across connections; never regress newer state
+	if seq := update.GetSeq(); seq != 0 {
+		if seq <= w.statusSeq {
+			return nil
+		}
+		w.statusSeq = seq
+	}
+
 	if status := update.Status; status != nil && w.status != *status {
 		w.status = *status
 		w.Logger().Debugw("worker status changed", "status", w.status)
 	}
 	w.load = update.GetLoad()
+	w.draining = update.GetDraining()
 
 	return nil
+}
+
+func (w *Worker) Draining() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.draining
 }
 
 func (w *Worker) HandleMigrateJob(req *livekit.MigrateJobRequest) error {
